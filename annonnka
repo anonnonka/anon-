@@ -1,0 +1,435 @@
+import os
+import sqlite3
+import datetime
+import secrets
+from flask import Flask, request, session, redirect, render_template_string, flash, abort
+from werkzeug.security import generate_password_hash, check_password_hash
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-me')
+DB = 'unknown_hall.db'
+
+# Предустановленный админ
+ADMIN_USERNAME = 'admin'
+ADMIN_PASSWORD = 'x7#kL9$mN2@qP5!wR8&tY3uI4oP6aS1dF0gH'  # сложный пароль
+
+def init_db():
+    with sqlite3.connect(DB) as con:
+        con.executescript('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            price TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            sender_id INTEGER NOT NULL,
+            receiver_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(item_id) REFERENCES items(id),
+            FOREIGN KEY(sender_id) REFERENCES users(id),
+            FOREIGN KEY(receiver_id) REFERENCES users(id)
+        );
+        ''')
+        # Создаём админа, если нет
+        cur = con.execute('SELECT id FROM users WHERE username=?', (ADMIN_USERNAME,))
+        if not cur.fetchone():
+            con.execute('INSERT INTO users (username, password_hash, is_admin) VALUES (?,?,1)',
+                        (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD)))
+            con.commit()
+
+def get_db():
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
+
+@app.before_request
+def before():
+    init_db()
+
+def current_user():
+    if 'user_id' not in session:
+        return None
+    with get_db() as con:
+        return con.execute('SELECT * FROM users WHERE id=?', (session['user_id'],)).fetchone()
+
+BASE = '''
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Unknown Hall</title>
+<style>
+body { background:#0b0b0b; color:#e0e0e0; font-family: Arial, sans-serif; margin:0; }
+header { background:#111; padding:15px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #222; }
+a { color:#9ad; text-decoration:none; margin-right:10px; }
+.container { max-width:900px; margin:20px auto; padding:0 15px; }
+.card { background:#151515; border:1px solid #222; padding:15px; margin:10px 0; border-radius:8px; }
+input, textarea, select, button { background:#1c1c1c; color:#eee; border:1px solid #333; padding:8px; margin:4px 0; width:100%; box-sizing:border-box; }
+button { background:#2a2a2a; cursor:pointer; }
+button:hover { background:#333; }
+.flash { background:#332; padding:8px; margin:8px 0; }
+.menu a { margin-right:15px; }
+.small { color:#888; font-size:12px; }
+#splash { position:fixed; inset:0; background:#000; color:#fff; display:flex; align-items:center; justify-content:center; font-size:3em; z-index:9999; }
+</style>
+</head>
+<body>
+<div id="splash">Unknown Hall</div>
+<script>setTimeout(()=>{document.getElementById('splash').style.display='none'},3200);</script>
+<header>
+  <div><a href="/">Unknown Hall</a></div>
+  <nav>
+    {% if user %}
+      <a href="/">Главная</a>
+      {% if user.is_admin %}<a href="/admin">Админ</a>{% endif %}
+      <a href="/logout">Выход</a>
+    {% else %}
+      <a href="/login">Вход</a> <a href="/register">Регистрация</a>
+    {% endif %}
+  </nav>
+</header>
+<div class="container">
+{% with msgs = get_flashed_messages() %}
+  {% for m in msgs %}<div class="flash">{{ m }}</div>{% endfor %}
+{% endwith %}
+{% block content %}{% endblock %}
+</div>
+</body>
+</html>
+'''
+
+@app.route('/')
+def index():
+    cat = request.args.get('cat', 'все')
+    with get_db() as con:
+        if cat == 'все':
+            items = con.execute('''
+                SELECT items.*, users.username, users.is_admin
+                FROM items JOIN users ON items.user_id=users.id
+                ORDER BY items.id DESC
+            ''').fetchall()
+        else:
+            items = con.execute('''
+                SELECT items.*, users.username, users.is_admin
+                FROM items JOIN users ON items.user_id=users.id
+                WHERE category=? ORDER BY items.id DESC
+            ''', (cat,)).fetchall()
+    return render_template_string(BASE + '''
+    {% block content %}
+    <h1>Unknown Hall</h1>
+    <p class="small">Анонимная площадка. Без доступа к чужим паролям и личным сообщениям.</p>
+    <div class="menu">
+      <a href="/?cat=все">Все</a>
+      <a href="/?cat=одежда">Одежда</a>
+      <a href="/?cat=услуги">Услуги</a>
+      <a href="/?cat=предметы">Предметы</a>
+    </div>
+    {% if user %}
+      <p><a href="/add">+ Добавить предложение</a></p>
+    {% endif %}
+    {% for item in items %}
+      <div class="card">
+        <h3><a href="/item/{{ item.id }}">{{ item.title }}</a></h3>
+        <p>{{ item.description[:200] }}{% if item.description|length > 200 %}...{% endif %}</p>
+        <p class="small">
+          Категория: {{ item.category }} |
+          Автор: {% if item.is_admin %}is admin{% else %}{{ item.username }}{% endif %} |
+          Цена: {{ item.price or 'не указана' }}
+        </p>
+      </div>
+    {% else %}
+      <p>Пока нет предложений.</p>
+    {% endfor %}
+    {% endblock %}
+    ''')
+
+@app.route('/add', methods=['GET','POST'])
+def add():
+    if not current_user():
+        return redirect('/login')
+    if request.method == 'POST':
+        category = request.form['category']
+        title = request.form['title'].strip()
+        description = request.form['description'].strip()
+        price = request.form.get('price','').strip()
+        if category not in ('одежда','услуги','предметы'):
+            flash('Неверная категория')
+            return redirect('/add')
+        if not title or not description:
+            flash('Заполните название и описание')
+            return redirect('/add')
+        with get_db() as con:
+            con.execute('INSERT INTO items (user_id, category, title, description, price, created_at) VALUES (?,?,?,?,?,?)',
+                        (session['user_id'], category, title, description, price, datetime.datetime.now().isoformat()))
+            con.commit()
+        flash('Предложение добавлено')
+        return redirect('/')
+    return render_template_string(BASE + '''
+    {% block content %}
+    <h1>Добавить предложение</h1>
+    <form method="post">
+      <label>Категория</label>
+      <select name="category">
+        <option value="одежда">Одежда</option>
+        <option value="услуги">Услуги</option>
+        <option value="предметы">Предметы</option>
+      </select>
+      <label>Название</label><input name="title" maxlength="100" required>
+      <label>Описание</label><textarea name="description" rows="5" required></textarea>
+      <label>Цена</label><input name="price" maxlength="50">
+      <button type="submit">Опубликовать</button>
+    </form>
+    {% endblock %}
+    ''')
+
+@app.route('/item/<int:item_id>', methods=['GET','POST'])
+def item(item_id):
+    user = current_user()
+    if not user:
+        return redirect('/login')
+    with get_db() as con:
+        item = con.execute('''
+            SELECT items.*, users.username, users.is_admin
+            FROM items JOIN users ON items.user_id=users.id
+            WHERE items.id=?
+        ''', (item_id,)).fetchone()
+        if not item:
+            abort(404)
+        if request.method == 'POST' and user['id'] != item['user_id']:
+            text = request.form.get('text','').strip()
+            if text:
+                con.execute('INSERT INTO messages (item_id, sender_id, receiver_id, text, created_at) VALUES (?,?,?,?,?)',
+                            (item_id, user['id'], item['user_id'], text, datetime.datetime.now().isoformat()))
+                con.commit()
+                flash('Сообщение отправлено')
+                return redirect(f'/chat/{item_id}/{item["user_id"]}')
+        conversations = []
+        if user['id'] == item['user_id']:
+            conversations = con.execute('''
+                SELECT DISTINCT sender_id, users.username, users.is_admin
+                FROM messages
+                JOIN users ON messages.sender_id = users.id
+                WHERE item_id=? AND receiver_id=?
+            ''', (item_id, user['id'])).fetchall()
+    return render_template_string(BASE + '''
+    {% block content %}
+    <h1>{{ item.title }}</h1>
+    <p>{{ item.description }}</p>
+    <p class="small">
+      Категория: {{ item.category }} |
+      Автор: {% if item.is_admin %}is admin{% else %}{{ item.username }}{% endif %} |
+      Цена: {{ item.price or 'не указана' }}
+    </p>
+    {% if user.id != item.user_id %}
+      <h2>Написать автору</h2>
+      <form method="post">
+        <textarea name="text" rows="3" required placeholder="Ваше сообщение"></textarea>
+        <button type="submit">Отправить</button>
+      </form>
+    {% else %}
+      <h2>Сообщения по объявлению</h2>
+      {% for c in conversations %}
+        <div class="card">
+          <a href="/chat/{{ item.id }}/{{ c.sender_id }}">
+            Чат с {% if c.is_admin %}is admin{% else %}{{ c.username }}{% endif %}
+          </a>
+        </div>
+      {% else %}
+        <p>Пока нет сообщений.</p>
+      {% endfor %}
+    {% endif %}
+    {% endblock %}
+    ''', item=item, conversations=conversations)
+
+@app.route('/chat/<int:item_id>/<int:other_id>', methods=['GET','POST'])
+def chat(item_id, other_id):
+    user = current_user()
+    if not user:
+        return redirect('/login')
+    with get_db() as con:
+        item = con.execute('SELECT * FROM items WHERE id=?', (item_id,)).fetchone()
+        if not item:
+            abort(404)
+        if user['id'] not in (item['user_id'], other_id):
+            abort(403)
+        if request.method == 'POST':
+            text = request.form.get('text','').strip()
+            if text:
+                con.execute('INSERT INTO messages (item_id, sender_id, receiver_id, text, created_at) VALUES (?,?,?,?,?)',
+                            (item_id, user['id'], other_id, text, datetime.datetime.now().isoformat()))
+                con.commit()
+                return redirect(f'/chat/{item_id}/{other_id}')
+        messages = con.execute('''
+            SELECT messages.*, users.username, users.is_admin
+            FROM messages
+            JOIN users ON messages.sender_id = users.id
+            WHERE item_id=? AND ((sender_id=? AND receiver_id=?) OR (sender_id=? AND receiver_id=?))
+            ORDER BY messages.id ASC
+        ''', (item_id, user['id'], other_id, other_id, user['id'])).fetchall()
+        other = con.execute('SELECT username, is_admin FROM users WHERE id=?', (other_id,)).fetchone()
+    return render_template_string(BASE + '''
+    {% block content %}
+    <h1>Чат: {{ item.title }}</h1>
+    <p class="small">
+      С {% if other.is_admin %}is admin{% else %}{{ other.username }}{% endif %}
+    </p>
+    <div style="max-height:400px; overflow:auto; border:1px solid #222; padding:10px; background:#111;">
+      {% for m in messages %}
+        <p>
+          <b>{% if m.is_admin %}is admin{% else %}{{ m.username }}{% endif %}:</b>
+          {{ m.text }}
+          <span class="small">{{ m.created_at }}</span>
+        </p>
+      {% else %}
+        <p>Сообщений пока нет.</p>
+      {% endfor %}
+    </div>
+    <form method="post">
+      <textarea name="text" rows="3" required></textarea>
+      <button type="submit">Отправить</button>
+    </form>
+    {% endblock %}
+    ''', item=item, messages=messages, other=other)
+
+@app.route('/admin')
+def admin():
+    user = current_user()
+    if not user or not user['is_admin']:
+        abort(403)
+    with get_db() as con:
+        users = con.execute('SELECT id, username, is_admin FROM users').fetchall()
+        items = con.execute('''
+            SELECT items.*, users.username, users.is_admin
+            FROM items JOIN users ON items.user_id=users.id
+        ''').fetchall()
+    return render_template_string(BASE + '''
+    {% block content %}
+    <h1>Админ-панель</h1>
+    <h2>Пользователи</h2>
+    {% for u in users %}
+      <div class="card">
+        {{ u.username }} {% if u.is_admin %}(админ){% endif %}
+        {% if not u.is_admin %}
+        <form method="post" action="/admin/delete_user/{{ u.id }}" style="display:inline">
+          <button type="submit">Удалить</button>
+        </form>
+        {% endif %}
+      </div>
+    {% endfor %}
+    <h2>Предложения</h2>
+    {% for i in items %}
+      <div class="card">
+        {{ i.title }} (
+          {% if i.is_admin %}is admin{% else %}{{ i.username }}{% endif %}
+        )
+        <form method="post" action="/admin/delete_item/{{ i.id }}" style="display:inline">
+          <button type="submit">Удалить</button>
+        </form>
+      </div>
+    {% endfor %}
+    {% endblock %}
+    ''', users=users, items=items)
+
+@app.route('/admin/delete_user/<int:uid>', methods=['POST'])
+def admin_delete_user(uid):
+    user = current_user()
+    if not user or not user['is_admin']:
+        abort(403)
+    with get_db() as con:
+        con.execute('DELETE FROM messages WHERE sender_id=? OR receiver_id=?', (uid, uid))
+        con.execute('DELETE FROM items WHERE user_id=?', (uid,))
+        con.execute('DELETE FROM users WHERE id=? AND is_admin=0', (uid,))
+        con.commit()
+    flash('Пользователь удалён')
+    return redirect('/admin')
+
+@app.route('/admin/delete_item/<int:iid>', methods=['POST'])
+def admin_delete_item(iid):
+    user = current_user()
+    if not user or not user['is_admin']:
+        abort(403)
+    with get_db() as con:
+        con.execute('DELETE FROM messages WHERE item_id=?', (iid,))
+        con.execute('DELETE FROM items WHERE id=?', (iid,))
+        con.commit()
+    flash('Предложение удалено')
+    return redirect('/admin')
+
+@app.route('/register', methods=['GET','POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username'].strip()
+        password = request.form['password']
+        if not (1 <= len(username) <= 20):
+            flash('Псевдоним от 1 до 20 символов')
+            return redirect('/register')
+        if len(password) < 6:
+            flash('Пароль минимум 6 символов')
+            return redirect('/register')
+        with get_db() as con:
+            try:
+                con.execute('INSERT INTO users (username, password_hash) VALUES (?,?)',
+                            (username, generate_password_hash(password)))
+                con.commit()
+                flash('Регистрация успешна. Войдите.')
+                return redirect('/login')
+            except sqlite3.IntegrityError:
+                flash('Такой псевдоним уже занят')
+                return redirect('/register')
+    return render_template_string(BASE + '''
+    {% block content %}
+    <h1>Регистрация</h1>
+    <form method="post">
+      <label>Псевдоним (до 20 символов)</label><input name="username" maxlength="20" required>
+      <label>Пароль</label><input type="password" name="password" required>
+      <button type="submit">Создать аккаунт</button>
+    </form>
+    {% endblock %}
+    ''')
+
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username'].strip()
+        password = request.form['password']
+        with get_db() as con:
+            user = con.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+        if user and check_password_hash(user['password_hash'], password):
+            session['user_id'] = user['id']
+            flash('Вы вошли')
+            return redirect('/')
+        flash('Неверный псевдоним или пароль')
+    return render_template_string(BASE + '''
+    {% block content %}
+    <h1>Вход</h1>
+    <form method="post">
+      <label>Псевдоним</label><input name="username" maxlength="20" required>
+      <label>Пароль</label><input type="password" name="password" required>
+      <button type="submit">Войти</button>
+    </form>
+    {% endblock %}
+    ''')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('Вы вышли')
+    return redirect('/')
+
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=True)
